@@ -21,6 +21,8 @@ jobs:
           corepack prepare yarn@4.18.1 --activate
       - name: Install dependencies
         run: corepack yarn install --immutable
+      - name: Build oxlint JS plugin dependency
+        run: corepack yarn workspace @zwave-js/eslint-plugin run build
       - name: Lint changed files
         run: |
           corepack yarn oxlint --type-aware \
