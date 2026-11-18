@@ -1,0 +1,33 @@
+name: Report-flood branch tests
+
+# Fork-only workflow: runs the report-flood test suites on the patched branch.
+on:
+  push:
+    branches:
+      - report-flood-monitor
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: |
+          corepack enable
+          corepack yarn install --immutable
+      - name: Lint changed files
+        run: |
+          corepack yarn oxlint --type-aware \
+            packages/zwave-js/src/lib/driver/ReportFloodMonitor.ts \
+            packages/zwave-js/src/lib/driver/ReportFloodMonitor.test.ts \
+            packages/zwave-js/src/lib/driver/Driver.ts \
+            packages/zwave-js/src/lib/controller/Controller.ts \
+            packages/zwave-js/src/lib/controller/ControllerStatistics.ts
+      - name: Unit tests (report-flood monitor + statistics)
+        run: |
+          corepack yarn vitest run \
+            packages/zwave-js/src/lib/driver/ReportFloodMonitor.test.ts \
+            packages/zwave-js/src/lib/driver/Statistics.test.ts
