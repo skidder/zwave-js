@@ -14,6 +14,9 @@ export class ControllerStatisticsHost extends StatisticsHost<ControllerStatistic
 			timeoutResponse: 0,
 			timeoutCallback: 0,
 			messagesDroppedTX: 0,
+			timeJammed: 0,
+			timeUnresponsive: 0,
+			jammedTransmitAttempts: 0,
 		};
 	}
 
@@ -66,6 +69,16 @@ export interface ControllerStatistics {
 	timeoutCallback: number;
 	/** No. of outgoing messages that were dropped because they could not be sent */
 	messagesDroppedTX: number;
+	/**
+	 * How long the controller was in the `Jammed` state in ms.
+	 * Because `Jammed` only clears on the next transmit, this may overstate
+	 * the actual jam duration on quiet networks.
+	 */
+	timeJammed: number;
+	/** How long the controller was in the `Unresponsive` state in ms */
+	timeUnresponsive: number;
+	/** No. of transmit attempts that failed because the controller was jammed */
+	jammedTransmitAttempts: number;
 
 	/**
 	 * Background RSSI of the network in dBm. These values are typically between -100 and -30, but can be even smaller (down to -128 dBm) in quiet environments.

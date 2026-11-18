@@ -123,6 +123,7 @@ import {
 	securityClassIsS2,
 	securityClassOrder,
 	serializeCacheValue,
+	supervisedCommandSucceeded,
 	timespan,
 	wasControllerReset,
 } from "@zwave-js/core";
@@ -244,6 +245,7 @@ import {
 	NodeStatus,
 	type ZWaveNodeEventCallbacks,
 	type ZWaveNotificationCallback,
+	type ZWaveNodeValueUpdatedArgs,
 	zWaveNodeEvents,
 } from "../node/_Types.js";
 import type { ZWaveNodeBase } from "../node/mixins/00_Base.js";
@@ -274,6 +276,13 @@ import {
 	PartialCCSessionManager,
 } from "./PartialCCSessionManager.js";
 import { type SerialAPIQueueItem, TransactionQueue } from "./Queue.js";
+import {
+	type MaintenanceFinding,
+	type MaintenanceVerification,
+	ReportFloodMonitor,
+	type ReportingParam,
+	toReportingParam,
+} from "./ReportFloodMonitor.js";
 import {
 	type SerialAPICommandMachineInput,
 	createSerialAPICommandMachine,
@@ -808,6 +817,9 @@ export interface DriverEventCallbacks extends PrefixedNodeEvents {
 	"all nodes ready": () => void;
 	"firmware update progress": (progress: OTWFirmwareUpdateProgress) => void;
 	"firmware update finished": (result: OTWFirmwareUpdateResult) => void;
+	"maintenance finding": (finding: MaintenanceFinding) => void;
+	"maintenance finding updated": (finding: MaintenanceFinding) => void;
+	"maintenance finding resolved": (finding: MaintenanceFinding) => void;
 	error: (err: Error) => void;
 }
 
@@ -974,6 +986,10 @@ export class Driver
 	// the next poll is pollTime + commandTime.
 	private _lastPollCommandTime: number = 0;
 	private _pollDelayTimer: Timer | undefined;
+	/** Monitors the network for report-flood findings (passive) */
+	private _reportFloodMonitor: ReportFloodMonitor | undefined;
+	/** Periodic evaluation of the report-flood detection rules */
+	private _reportFloodEvaluationTimer: Interval | undefined;
 
 	/** Gives access to the transaction queues, ordered by priority */
 	private get queues(): TransactionQueue[] {
@@ -2104,6 +2120,10 @@ export class Driver
 			// TODO: Remove along with mustHoldTransaction
 			.on("inclusion state changed", () => this.triggerQueues());
 
+		// Set up the report flood monitor, which passively detects nodes
+		// that flood the controller with excessive reports
+		this.setupReportFloodMonitor();
+
 		// Create and start all queues after creating the controller instance
 		this.initTransactionQueues();
 		this.initSerialAPIQueue();
@@ -2624,7 +2644,9 @@ export class Driver
 				"firmware update finished",
 				this.onNodeFirmwareUpdated.bind(this),
 			)
-			.on("notification", this.onNodeNotification.bind(this));
+			.on("notification", this.onNodeNotification.bind(this))
+			// Feed Meter CC value updates into the report flood monitor
+			.on("value updated", this.onNodeValueUpdated.bind(this));
 
 		// Add forwarders for all node events
 		for (const event of zWaveNodeEvents) {
@@ -3127,6 +3149,184 @@ export class Driver
 
 	private onControllerStatusChanged(_status: ControllerStatus): void {
 		this.triggerQueues();
+
+		switch (_status) {
+			case ControllerStatus.Jammed:
+			case ControllerStatus.Unresponsive:
+			case ControllerStatus.Ready:
+				this._reportFloodMonitor?.recordControllerStatus(_status);
+				break;
+		}
+	}
+
+	/**
+	 * Creates the report flood monitor and the periodic timer that evaluates
+	 * the detection rules. Called once when the controller is initialized.
+	 */
+	private setupReportFloodMonitor(): void {
+		this._reportFloodMonitor = new ReportFloodMonitor({
+			onFindingEvent: (event, finding) => {
+				this.emit(event, finding);
+			},
+			getReportingParams: (nodeId) =>
+				this.getReportingParamsForNode(nodeId),
+			getNodeValue: (nodeId, parameter) =>
+				this.getValueDB(nodeId).getValue({
+					commandClass: CommandClasses.Configuration,
+					property: parameter,
+				}),
+			queryConfigParam: async (nodeId, parameter) => {
+				const node = this.controller.nodes.get(nodeId);
+				if (!node) return undefined;
+				// The Configuration CC Get bypasses the cache and sends an
+				// actual query to the device
+				return await node.commandClasses.Configuration.get(parameter);
+			},
+		});
+		this._reportFloodMonitor.start();
+
+		// Evaluate the rules every 5 minutes. The rules operate on trailing
+		// windows of 60 minutes and 24 hours, so this is granular enough.
+		this._reportFloodEvaluationTimer = setInterval(() => {
+			void this.evaluateReportFloodRules();
+		}, timespan.minutes(5)).unref();
+	}
+
+	private stopReportFloodMonitor(): void {
+		this._reportFloodEvaluationTimer?.unref();
+		this._reportFloodEvaluationTimer = undefined;
+		this._reportFloodMonitor?.stop();
+		this._reportFloodMonitor = undefined;
+	}
+
+	private async evaluateReportFloodRules(): Promise<void> {
+		const monitor = this._reportFloodMonitor;
+		if (!monitor) return;
+		try {
+			await monitor.evaluate();
+			await monitor.tickVerification(
+				async (nodeId, parameter) => {
+					const node = this.controller.nodes.get(nodeId);
+					if (!node) return undefined;
+					return await node.commandClasses.Configuration.get(
+						parameter,
+					);
+				},
+				(findingId, nodeId) => {
+					const finding =
+						this._reportFloodMonitor?.getFinding(findingId);
+					const node = finding?.nodes.find(
+						(n) => n.nodeId === nodeId,
+					);
+					return node?.suggestionRows.find(
+						(r) => !r.refusedReason && !r.needsGet,
+					);
+				},
+			);
+		} catch {
+			// Never let monitoring break the driver
+		}
+	}
+
+	/**
+	 * Collects the config parameters of a node that are tagged with a
+	 * reporting `$purpose` (e.g. `reporting_threshold.power`).
+	 */
+	private async getReportingParamsForNode(
+		nodeId: number,
+	): Promise<ReportingParam[]> {
+		const node = this.controller.nodes.get(nodeId);
+		const paramInfo = node?.deviceConfig?.paramInformation;
+		if (!paramInfo) return [];
+		const ret: ReportingParam[] = [];
+		for (const [key, info] of paramInfo.entries()) {
+			// Partial parameters cannot be written safely here
+			if (key.valueBitMask != undefined) continue;
+			if (!info.purpose?.startsWith("reporting_")) continue;
+			ret.push(toReportingParam(info));
+		}
+		return ret;
+	}
+
+	/** Feeds Meter CC value updates and power values into the report flood monitor */
+	private onNodeValueUpdated(
+		node: ZWaveNode,
+		args: ZWaveNodeValueUpdatedArgs,
+	): void {
+		const monitor = this._reportFloodMonitor;
+		if (!monitor) return;
+		if (
+			args.commandClass === CommandClasses.Meter
+			&& args.property === "value"
+			&& typeof args.propertyKey === "number"
+		) {
+			// Electric meter scales:
+			// 0 = kWh (energy), 2 = W (power), 4 = V (voltage), 5 = A (current)
+			switch (args.propertyKey) {
+				case 0:
+					monitor.recordMeterScaleUpdate(node.id, "energy");
+					break;
+				case 2:
+					monitor.recordMeterScaleUpdate(node.id, "power");
+					if (typeof args.newValue === "number") {
+						monitor.recordPowerValue(node.id, args.newValue);
+					}
+					break;
+				case 4:
+					monitor.recordMeterScaleUpdate(node.id, "voltage");
+					break;
+				case 5:
+					monitor.recordMeterScaleUpdate(node.id, "current");
+					break;
+			}
+		}
+	}
+
+	/** Returns all currently active maintenance findings (report flood) */
+	public getMaintenanceFindings(): readonly MaintenanceFinding[] {
+		return this._reportFloodMonitor?.getFindings() ?? [];
+	}
+
+	/**
+	 * Applies the suggested configuration changes for a node of a maintenance
+	 * finding by writing all offered rows via the Configuration CC.
+	 *
+	 * This is the explicit user action - the driver never applies
+	 * suggestions on its own.
+	 */
+	public async applyMaintenanceSuggestion(
+		findingId: string,
+		nodeId: number,
+	): Promise<MaintenanceVerification> {
+		const monitor = this._reportFloodMonitor;
+		if (!monitor) {
+			throw new ZWaveError(
+				`Cannot apply a maintenance suggestion: The driver is not initialized`,
+				ZWaveErrorCodes.Driver_NotReady,
+			);
+		}
+		return monitor.applySuggestion(
+			findingId,
+			nodeId,
+			async (nodeId, parameter, value) => {
+				const node = this.controller.nodes.get(nodeId);
+				if (!node) return { setOK: false };
+				try {
+					const result = await node.commandClasses.Configuration.set({
+						parameter,
+						value,
+					});
+					return {
+						setOK:
+							result == undefined
+								? true
+								: supervisedCommandSucceeded(result),
+					};
+				} catch {
+					return { setOK: false };
+				}
+			},
+		);
 	}
 
 	private async onNetworkFound(
@@ -3954,6 +4154,9 @@ export class Driver
 
 		this.driverLog.print("destroying driver instance...");
 
+		// Stop the report flood monitor first so no more findings are evaluated
+		this.stopReportFloodMonitor();
+
 		// First stop the scheduler, all queues and close the serial port, so nothing happens anymore
 		await this._scheduler.stop();
 
@@ -4009,6 +4212,9 @@ export class Driver
 		);
 
 		this.requestHandlers.clear();
+
+		// Stop the report flood monitor along with the controller instance
+		this.stopReportFloodMonitor();
 
 		// Attempt to close the value DBs and network cache
 		await this.closeDatabases();
@@ -4216,7 +4422,10 @@ export class Driver
 			// And update statistics
 			if (!!this._controller) {
 				if (containsCC(msg)) {
-					this.tryGetNode(msg)?.incrementStatistics("commandsRX");
+					const node = this.tryGetNode(msg);
+					node?.incrementStatistics("commandsRX");
+					// Feed the per-node inbound count into the report flood monitor
+					if (node) this._reportFloodMonitor?.recordRX(node.id);
 				} else {
 					this._controller.incrementStatistics("messagesRX");
 				}
@@ -7021,6 +7230,12 @@ ${handlers.length} left`,
 							&& prevResult.txReport?.txTicks === 0
 						) {
 							jammedAttempts++;
+							// Keep track of jammed transmit attempts for the
+							// report flood finding and in the statistics
+							this.controller.incrementStatistics(
+								"jammedTransmitAttempts",
+							);
+							this._reportFloodMonitor?.recordJammedTransmitAttempt();
 							attemptNumber--;
 							if (jammedAttempts < maxJammedAttempts) {
 								// The controller is jammed. Wait a bit, then try again.

@@ -601,6 +601,8 @@ export class ZWaveController extends TypedEventTarget<ControllerEventCallbacks> 
 	}
 
 	private _status: ControllerStatus = ControllerStatus.Ready;
+	/** When the controller entered the current Jammed/Unresponsive episode */
+	private _statusChangedAt: number | undefined;
 	/**
 	 * Which status the controller is believed to be in
 	 */
@@ -617,6 +619,39 @@ export class ZWaveController extends TypedEventTarget<ControllerEventCallbacks> 
 
 		const oldStatus = this._status;
 		this._status = newStatus;
+
+		// Track how long the controller spends in the Jammed/Unresponsive states
+		const now = Date.now();
+		if (
+			(newStatus === ControllerStatus.Jammed
+				&& oldStatus !== ControllerStatus.Unresponsive)
+			|| (newStatus === ControllerStatus.Unresponsive
+				&& oldStatus !== ControllerStatus.Jammed)
+		) {
+			// A new episode starts, unless we switch between the two states
+			this._statusChangedAt = now;
+		} else if (newStatus === ControllerStatus.Ready) {
+			if (
+				oldStatus === ControllerStatus.Jammed
+				&& this._statusChangedAt
+			) {
+				this.updateStatistics((s) => ({
+					...s,
+					timeJammed: s.timeJammed + (now - this._statusChangedAt!),
+				}));
+				this._statusChangedAt = undefined;
+			} else if (
+				oldStatus === ControllerStatus.Unresponsive
+				&& this._statusChangedAt
+			) {
+				this.updateStatistics((s) => ({
+					...s,
+					timeUnresponsive:
+						s.timeUnresponsive + (now - this._statusChangedAt!),
+				}));
+				this._statusChangedAt = undefined;
+			}
+		}
 
 		if (newStatus === ControllerStatus.Jammed) {
 			this.driver.controllerLog.print("The controller is jammed", "warn");
